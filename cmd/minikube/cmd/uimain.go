@@ -35,7 +35,7 @@ var mwindows = []Window{
 	//		`, refresh: 20},
 	//Window{x: 0, y: 8, w: 120, h: 22 ,header: "Pods", body:`
 	//		Pods
-   //----
+	//----
 	//		%s
 	//		`, refresh: 20},
 }
@@ -175,13 +175,18 @@ func status() (Status) {
 	if hostSt == state.Running.String() {
 		clusterBootstrapper, err := getClusterBootstrapper(api, "kubeadm")
 		if err != nil {
-			exit.WithError("Error getting bootstrapper", err)
+			//exit.WithError("Error getting bootstrapper", err)
 		}
-		kubeletSt, err = clusterBootstrapper.GetKubeletStatus()
-		if err != nil {
-			//fmt.Println("kubelet err: %v", err)
-			returnCode |= clusterNotRunningStatusFlag
-		} else if kubeletSt != state.Running.String() {
+
+		if (clusterBootstrapper!=nil) {
+			kubeletSt, err = clusterBootstrapper.GetKubeletStatus()
+			if err != nil {
+				//fmt.Println("kubelet err: %v", err)
+				returnCode |= clusterNotRunningStatusFlag
+			} else if kubeletSt != state.Running.String() {
+				returnCode |= clusterNotRunningStatusFlag
+			}
+		} else {
 			returnCode |= clusterNotRunningStatusFlag
 		}
 
@@ -196,10 +201,14 @@ func status() (Status) {
 			apiserverPort = constants.APIServerPort
 		}
 
-		apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip, apiserverPort)
-		if err != nil {
-			//fmt.Println("Error apiserver status:", err)
-		} else if apiserverSt != state.Running.String() {
+		if (clusterBootstrapper!=nil) {
+			apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip, apiserverPort)
+			if err != nil {
+				//fmt.Println("Error apiserver status:", err)
+			} else if apiserverSt != state.Running.String() {
+				returnCode |= clusterNotRunningStatusFlag
+			}
+		} else {
 			returnCode |= clusterNotRunningStatusFlag
 		}
 
