@@ -5,67 +5,135 @@ import (
 	"fmt"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/jroimartin/gocui"
+	"github.com/spf13/viper"
 	"k8s.io/minikube/pkg/minikube/cluster"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/kubeconfig"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/out"
 	"log"
-	"os"
-	"sync"
 	"text/template"
 	"time"
 )
 
 
-var g *gocui.Gui
+var (
+	done = make(chan struct{})
+	finish = make(chan struct{})
+	g *gocui.Gui
+	listprofile  []string
+)
 
-func init() {
-	g, _ = gocui.NewGui(gocui.OutputNormal)
-}
 
-var mwindows = []Window{
-	Window{x: 0, y: 0, w:40, h:6, header: "Status", body: ``, refresh: 20 ,
-		refreshFN: nil },
-	//Window{x: 41, y: 0, w: 120, h:6 ,header: "Profile", body:`
-	//		minikube directory   : %s
-	//		current profile name : %s
-	//		current machine size : %s
-	//		`, refresh: 20},
-	//Window{x: 0, y: 8, w: 120, h: 22 ,header: "Pods", body:`
-	//		Pods
-	//----
-	//		%s
-	//		`, refresh: 20},
-}
-
-func refreshstatus() {
-
-	defer wg.Done()
-
+func refreshprofilewindow(profilename string) {
 	for {
 		select {
-		case <-done:
-			return
-		case <-time.After(20 * time.Second):
+		case <-time.After(10 * time.Second):
+			getAllProfiles()
+
+			//check to make sure that the view still exist
+			if err,_ := g.View(profilename); err == nil {
+				return
+			}
+
 			g.Update(func(g *gocui.Gui) error {
-				v, err := g.View("Status")
+				v, err := g.View(profilename)
 
 				if (err!=nil) {
-					os.Exit(-2)
+					return nil
 				}
 
-				s:=status()
-
-				v.BgColor = gocui.ColorYellow
 				v.Clear()
-
-				fmt.Fprintln(v,printKubeletStatus(s)	 )
+				fmt.Fprintln(v,printKubeletStatus(checkStatus(profilename))	 )
 				return nil
 			})
 		}
 	}
+}
+
+func checkStatus(profilename string) (Status) {
+	// get status
+	api, err := machine.NewAPIClient()
+	if err != nil {
+		exit.WithCodeT(exit.Unavailable, "Error getting client: {{.error}}", out.V{"error": err})
+	}
+	defer api.Close()
+
+	var status Status
+
+	hostSt, err := cluster.GetHostStatus(api, profilename)
+	if err != nil {
+		//exit.WithError("Error getting host status", err)
+	}
+
+	kubeletSt := state.None.String()
+	kubeconfigSt := state.None.String()
+	apiserverSt := state.None.String()
+
+	var returnCode = 0
+
+	if hostSt == state.Running.String() {
+		viper.Set(config.MachineProfile,profilename)
+		clusterBootstrapper, err := getClusterBootstrapper(api, "kubeadm")
+		if err != nil {
+			//exit.WithError("Error getting bootstrapper", err)
+		}
+
+		if (clusterBootstrapper != nil) {
+			kubeletSt, err = clusterBootstrapper.GetKubeletStatus()
+			if err != nil {
+				//fmt.Println("kubelet err: %v", err)
+				returnCode |= clusterNotRunningStatusFlag
+			} else if kubeletSt != state.Running.String() {
+				returnCode |= clusterNotRunningStatusFlag
+			}
+		} else {
+			returnCode |= clusterNotRunningStatusFlag
+		}
+
+		ip, err := cluster.GetHostDriverIP(api, profilename)
+		if err != nil {
+			//fmt.Println("Error host driver ip status:", err)
+		}
+
+		apiserverPort, err := kubeconfig.Port(profilename)
+		if err != nil {
+			// Fallback to presuming default apiserver port
+			apiserverPort = constants.APIServerPort
+		}
+
+		if (clusterBootstrapper != nil) {
+			apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip, apiserverPort)
+			if err != nil {
+				//fmt.Println("Error apiserver status:", err)
+			} else if apiserverSt != state.Running.String() {
+				returnCode |= clusterNotRunningStatusFlag
+			}
+		} else {
+			returnCode |= clusterNotRunningStatusFlag
+		}
+
+		ks, err := kubeconfig.IsClusterInConfig(ip, profilename)
+		if ks {
+			kubeconfigSt = KubeconfigStatus.Configured
+		} else {
+			kubeconfigSt = KubeconfigStatus.Misconfigured
+			returnCode |= k8sNotRunningStatusFlag
+		}
+	} else {
+		returnCode |= minikubeNotRunningStatusFlag
+	}
+
+	status = Status{
+		Host:       hostSt,
+		Kubelet:    kubeletSt,
+		APIServer:  apiserverSt,
+		Kubeconfig: kubeconfigSt,
+	}
+
+	return status
 }
 
 
@@ -87,152 +155,128 @@ func printKubeletStatus( status Status) (string) {
 	return val
 }
 
+func UIMain() {
+	g, _ = gocui.NewGui(gocui.OutputNormal)
 
-var (
-	done = make(chan struct{})
-	wg   sync.WaitGroup
+	defer g.Close()
 
-	mu  sync.Mutex // protects ctr
-	ctr = 0
-)
+	g.Highlight = true
+	g.SelFgColor = gocui.ColorDefault
+
+	getAllProfiles()
+	g.SetManagerFunc(Layout)
+
+	go checkViews()
+	if err := keybindings(); err != nil {
+		log.Panicln(err)
+	}
+	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
+		log.Panicln(err)
+	}
 
 
-type Window struct {
-	x,y         int				// x,y position
-	w,h         int				// w,h width and height
-	header      string			// text header
-	body        string			// body
-	refresh     int				// content refresh time (-1 no refresh)
-	refreshFN   func()
 }
 
-func newView(x,y,w,h int, name string, body string) error {
-	v, err := g.SetView(name, x, y, w, h)
-	if err != nil {
-		if err != gocui.ErrUnknownView {
-			return err
+func checkViews() {
+	for {
+		select {
+		case <-finish:
+			return
+		case <-time.After(10 * time.Second):
+			listprofile= listprofile[:0]
+			getAllProfiles()
+			// delete view if it does not exist anymore
+			vfound := false
+
+			if len(g.Views())>0 {
+				for _, v := range g.Views() {
+					vfound = false
+					for _, p:= range listprofile {
+						if v.Name() == p {
+							vfound = true
+						}
+					}
+
+					if (! vfound) {
+						g.DeleteView(v.Name())
+						break;
+					}
+				}
+			}
+			//
+			//if (! vfound) {
+			//	for _, v := range g.Views() {
+			//		g.DeleteView(v.Name())
+			//	}
+			//}
+
+			// create view if there is a new profile
 		}
-		v.Wrap = true
 	}
-	if _, err := g.SetCurrentView(name); err != nil {
+}
+
+func Layout(gui *gocui.Gui) error {
+	x := 0
+	y := 0
+	wsize := 30
+	hsize := 30
+
+	// cross check the views with the profile list
+	// any view that is not available in the profile list
+	// remove that view
+	if len(listprofile) > 0 {
+		for _, profile  := range listprofile {
+			// check if the view exist....
+			v,err :=  g.View(profile)
+			// ... since err is nil that means view does not exist
+			if (v==nil) {
+				// ... create the view
+				v, err = g.SetView(profile, x, y, x+wsize, y+hsize)
+
+				if err != nil {
+					if err != gocui.ErrUnknownView {
+						log.Panicln(err)
+					}
+					v.Wrap = true
+					v.Title = profile
+
+					go refreshprofilewindow(profile)
+					x += wsize+1
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func keybindings() error {
+	if err := g.SetKeybinding("", gocui.KeyCtrlC, gocui.ModNone, quit); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (w *Window) Layout(g *gocui.Gui) error {
-	for _, w := range mwindows{
-		newView(w.x,w.y,w.w,w.h,w.header,w.body)
-	}
-
-	return nil
-}
-
-func UIMain() {
-	defer g.Close()
-
-	g.Highlight = true
-	g.SelFgColor = gocui.ColorRed
-
-	window  := Window{x: 0, y: 0, w:20, h:20, header: "Status", refresh: 20}
-	g.SetManagerFunc(window.Layout)
-
-	for i := 0; i < 1; i++ {
-		wg.Add(1)
-		go refreshstatus()
-	}
-
-	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
-		log.Panicln(err)
-	}
-
-}
-
 func quit(g *gocui.Gui, v *gocui.View) error {
+	<- finish
 	return gocui.ErrQuit
 }
 
-func status() (Status) {
-	// get status
+// get all local profiles
+// only interested in valid profiles
+func getAllProfiles() {
 	api, err := machine.NewAPIClient()
 	if err != nil {
 		exit.WithCodeT(exit.Unavailable, "Error getting client: {{.error}}", out.V{"error": err})
 	}
 	defer api.Close()
 
-	hostSt, err := cluster.GetHostStatus(api, "minikube")
-	if err != nil {
-		exit.WithError("Error getting host status", err)
+	validProfiles, _, err := config.ListProfiles()
+
+	if len(validProfiles) != 0 || err != nil {
+		for _, p := range validProfiles {
+			listprofile = append(listprofile, p.Name)
+		}
 	}
-
-	kubeletSt := state.None.String()
-	kubeconfigSt := state.None.String()
-	apiserverSt := state.None.String()
-
-	var returnCode = 0
-
-
-	if hostSt == state.Running.String() {
-		clusterBootstrapper, err := getClusterBootstrapper(api, "kubeadm")
-		if err != nil {
-			//exit.WithError("Error getting bootstrapper", err)
-		}
-
-		if (clusterBootstrapper!=nil) {
-			kubeletSt, err = clusterBootstrapper.GetKubeletStatus()
-			if err != nil {
-				//fmt.Println("kubelet err: %v", err)
-				returnCode |= clusterNotRunningStatusFlag
-			} else if kubeletSt != state.Running.String() {
-				returnCode |= clusterNotRunningStatusFlag
-			}
-		} else {
-			returnCode |= clusterNotRunningStatusFlag
-		}
-
-		ip, err := cluster.GetHostDriverIP(api, "minikube")
-		if err != nil {
-			//fmt.Println("Error host driver ip status:", err)
-		}
-
-		apiserverPort, err := kubeconfig.Port("minikube")
-		if err != nil {
-			// Fallback to presuming default apiserver port
-			apiserverPort = constants.APIServerPort
-		}
-
-		if (clusterBootstrapper!=nil) {
-			apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip, apiserverPort)
-			if err != nil {
-				//fmt.Println("Error apiserver status:", err)
-			} else if apiserverSt != state.Running.String() {
-				returnCode |= clusterNotRunningStatusFlag
-			}
-		} else {
-			returnCode |= clusterNotRunningStatusFlag
-		}
-
-		ks, err := kubeconfig.IsClusterInConfig(ip, "minikube")
-		if err != nil {
-			//fmt.Println("Error kubeconfig status:", err)
-		}
-		if ks {
-			kubeconfigSt = KubeconfigStatus.Configured
-		} else {
-			kubeconfigSt = KubeconfigStatus.Misconfigured
-			returnCode |= k8sNotRunningStatusFlag
-		}
-	} else {
-		returnCode |= minikubeNotRunningStatusFlag
-	}
-
-	status := Status{
-		Host:       hostSt,
-		Kubelet:    kubeletSt,
-		APIServer:  apiserverSt,
-		Kubeconfig: kubeconfigSt,
-	}
-	return status
 }
 
 
