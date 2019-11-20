@@ -18,14 +18,53 @@ import (
 	"time"
 )
 
+type wmatrix struct {
+	x,y int
+}
+
+type coordinate struct {
+	p1, p2 int
+}
+
 
 var (
 	done = make(chan struct{})
 	finish = make(chan struct{})
 	g *gocui.Gui
 	listprofile  []string
+	wmatrixarray map[string]wmatrix
+	X []coordinate
+	Y []coordinate
 )
 
+
+func init() {
+	// X
+	// -----
+	// 0,254
+	// 256,510
+	// 512,766
+	// 768,1024
+	X =  []coordinate{
+		{ p1: 0, p2: 254, },
+		{ p1: 265, p2: 510, },
+		{ p1: 512, p2: 766, },
+		{ p1: 768, p2: 1024, },
+	}
+
+	// Y
+	// ----
+	// 0,190
+	// 192,382
+	// 384,574
+	// 576,768
+	Y =  []coordinate{
+		{ p1: 0, p2: 190, },
+		{ p1: 192, p2: 382, },
+		{ p1: 384, p2: 574, },
+		{ p1: 576, p2: 768, },
+	}
+}
 
 func refreshprofilewindow(profilename string) {
 	for {
@@ -166,10 +205,12 @@ func UIMain() {
 	getAllProfiles()
 	g.SetManagerFunc(Layout)
 
-	go checkViews()
+
 	if err := keybindings(); err != nil {
 		log.Panicln(err)
 	}
+
+	go checkViews()
 	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
 		log.Panicln(err)
 	}
@@ -183,10 +224,10 @@ func checkViews() {
 		case <-finish:
 			return
 		case <-time.After(10 * time.Second):
-			listprofile= listprofile[:0]
 			getAllProfiles()
 			// delete view if it does not exist anymore
 			vfound := false
+			recalc := false
 
 			if len(g.Views())>0 {
 				for _, v := range g.Views() {
@@ -199,53 +240,109 @@ func checkViews() {
 
 					if (! vfound) {
 						g.DeleteView(v.Name())
+						g.Update(func(gui *gocui.Gui) error {
+							return nil
+						})
+						recalc = true
 						break;
 					}
 				}
 			}
-			//
-			//if (! vfound) {
-			//	for _, v := range g.Views() {
-			//		g.DeleteView(v.Name())
-			//	}
-			//}
 
 			// create view if there is a new profile
+			var viewName string
+
+			getAllProfiles()
+			for _, p:= range listprofile{
+				createNewView := true
+				viewName = p
+				for _, v := range g.Views()  {
+					if p == v.Name() {
+						createNewView = false
+						break
+					}
+				}
+
+				if createNewView{
+					v, _ := g.SetView(viewName, 0,0,1,1)
+					v.Wrap = true
+					v.Title = viewName
+					go refreshprofilewindow(viewName)
+					recalc=true
+				}
+			}
+
+
+
+
+			var x int = -1
+			var y int
+			var xwidth = 50
+			var ywidth = 25
+
+			if  (recalc) {
+				if len(g.Views()) > 0 {
+					for _, v := range g.Views() {
+						if (x > 4) {
+							x = 0
+							y++
+						} else {
+							x++
+						}
+
+						if (y > 4) {
+							y = 0
+							x = 0
+						}
+
+						startX := x * xwidth
+						startY := y * ywidth
+
+						endX := startX + (xwidth - 2)
+						endY := startY + (ywidth - 2)
+
+						name := v.Name()
+						g.SetView(name, startX, startY, endX, endY)
+
+					}
+				}
+			}
 		}
 	}
 }
 
 func Layout(gui *gocui.Gui) error {
-	x := 0
-	y := 0
-	wsize := 30
-	hsize := 30
+	//x := 0
+	//y := 0
+	//wsize := 30
+	//hsize := 30
 
 	// cross check the views with the profile list
 	// any view that is not available in the profile list
 	// remove that view
-	if len(listprofile) > 0 {
-		for _, profile  := range listprofile {
-			// check if the view exist....
-			v,err :=  g.View(profile)
-			// ... since err is nil that means view does not exist
-			if (v==nil) {
-				// ... create the view
-				v, err = g.SetView(profile, x, y, x+wsize, y+hsize)
-
-				if err != nil {
-					if err != gocui.ErrUnknownView {
-						log.Panicln(err)
-					}
-					v.Wrap = true
-					v.Title = profile
-
-					go refreshprofilewindow(profile)
-					x += wsize+1
-				}
-			}
-		}
-	}
+	getAllProfiles()
+	//if len(listprofile) > 0 {
+	//	for _, profile  := range listprofile {
+	//		// check if the view exist....
+	//		v,err :=  g.View(profile)
+	//		// ... since err is nil that means view does not exist
+	//		if (v==nil) {
+	//			// ... create the view
+	//			v, err = g.SetView(profile, x, y, x+wsize, y+hsize)
+	//
+	//			if err != nil {
+	//				if err != gocui.ErrUnknownView {
+	//					log.Panicln(err)
+	//				}
+	//				v.Wrap = true
+	//				v.Title = profile
+	//
+	//				go refreshprofilewindow(profile)
+	//				x += wsize+1
+	//			}
+	//		}
+	//	}
+	//}
 	return nil
 }
 
@@ -257,13 +354,14 @@ func keybindings() error {
 }
 
 func quit(g *gocui.Gui, v *gocui.View) error {
-	<- finish
+	//<- finish
 	return gocui.ErrQuit
 }
 
 // get all local profiles
 // only interested in valid profiles
 func getAllProfiles() {
+	listprofile= listprofile[:0]
 	api, err := machine.NewAPIClient()
 	if err != nil {
 		exit.WithCodeT(exit.Unavailable, "Error getting client: {{.error}}", out.V{"error": err})
